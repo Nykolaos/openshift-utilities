@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Set LC_NUMERIC to "C" to ensure consistent decimal point handling (dot) for bc and printf
+export LC_NUMERIC=C
+
 # Script to gather OpenShift workload resource requests/limits, quotas/limit ranges, and node details
 
 # Function to display script usage
@@ -104,11 +107,11 @@ convert_memory_to_bytes() {
   local bytes=0
 
   case "$unit" in
-    Ki|K|KiB) bytes=$(echo "scale=0; $num * 1024" | bc);;
-    Mi|M|MiB) bytes=$(echo "scale=0; $num * 1024 * 1024" | bc);;
-    Gi|G|GiB) bytes=$(echo "scale=0; $num * 1024 * 1024 * 1024" | bc);;
-    Ti|T|TiB) bytes=$(echo "scale=0; $num * 1024 * 1024 * 1024 * 1024" | bc);;
-    *) bytes=$(echo "scale=0; $num" | bc);; # Assume bytes if no unit or unknown unit
+    Ki|K|KiB) bytes=$(echo "scale=0; $num * 1024" | LC_NUMERIC=C bc);;
+    Mi|M|MiB) bytes=$(echo "scale=0; $num * 1024 * 1024" | LC_NUMERIC=C bc);;
+    Gi|G|GiB) bytes=$(echo "scale=0; $num * 1024 * 1024 * 1024" | LC_NUMERIC=C bc);;
+    Ti|T|TiB) bytes=$(echo "scale=0; $num * 1024 * 1024 * 1024 * 1024" | LC_NUMERIC=C bc);;
+    *) bytes=$(echo "scale=0; $num" | LC_NUMERIC=C bc);; # Assume bytes if no unit or unknown unit
   esac
   echo "$bytes"
 }
@@ -125,7 +128,7 @@ convert_memory_to_gib_bash() {
   if [ -n "$mem_bytes" ] && [ "$mem_bytes" -gt 0 ]; then
     # Ensure bc is available for division
     if command -v bc &> /dev/null; then
-      printf "%.2fGi" $(echo "scale=2; $mem_bytes / (1024 * 1024 * 1024)" | bc 2>/dev/null)
+      printf "%.2fGi" $(echo "scale=2; $mem_bytes / (1024 * 1024 * 1024)" | LC_NUMERIC=C bc 2>/dev/null)
     else
       echo "$value_with_unit" # Fallback if bc is not available
     fi
@@ -137,7 +140,7 @@ convert_memory_to_gib_bash() {
 # Helper function to convert memory values (in any unit) to MiB and append unit (for bash context)
 convert_memory_to_mib_bash() {
   local value_with_unit=$1
-  if [ -z "$value" ]; then # Changed to $value from $value_with_unit
+  if [ -z "$value_with_unit" ]; then
     echo ""
     return
   fi
@@ -145,7 +148,7 @@ convert_memory_to_mib_bash() {
   local mem_bytes=$(convert_memory_to_bytes "$value_with_unit")
   if [ -n "$mem_bytes" ] && [ "$mem_bytes" -gt 0 ]; then
     if command -v bc &> /dev/null; then
-      printf "%.2fMi" $(echo "scale=2; $mem_bytes / (1024 * 1024)" | bc 2>/dev/null)
+      printf "%.0fMi" $(echo "scale=0; $mem_bytes / (1024 * 1024)" | LC_NUMERIC=C bc 2>/dev/null) # Changed to %.0f
     else
       echo "$value_with_unit" # Fallback if bc is not available
     fi
@@ -165,7 +168,7 @@ format_cpu_cores_bash() {
 
   if [[ "$value" =~ m$ ]]; then
     # Convert millicores to cores
-    local cores=$(echo "scale=2; ${value%m} / 1000" | bc 2>/dev/null)
+    local cores=$(echo "scale=2; ${value%m} / 1000" | LC_NUMERIC=C bc 2>/dev/null)
     printf "%.2fcores" "$cores"
   elif [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     # If it's a number, assume cores and append " cores"
@@ -187,7 +190,9 @@ format_cpu_m_bash() {
     echo "$value" # Already in millicores
   elif [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     # Convert cores to millicores
-    local millicores=$(echo "scale=0; $value * 1000" | bc 2>/dev/null)
+    local millicores=$(echo "scale=0; $value * 1000" | LC_NUMERIC=C bc 2>/dev/null)
+    # Ensure this output is handled by printf as string or float if needed.
+    # Given the jq part rounds, it should be an integer, so "%d" is fine.
     printf "%dm" "$millicores"
   else
     echo "$value" # Return as is if unknown format
@@ -209,10 +214,10 @@ get_workload_resources() {
     def parse_memory_to_mib(value):
       if value == "" then 0
       else
-        (value | capture("^(?<num>[0-9.]+)(?<unit>[KMGTPEZY]i?B?)?$") as $captured |
-         if $captured.num? then
-           ($captured.num | tonumber? // 0) as $num |
-           ($captured.unit? // "") as $unit_str | # Default unit to empty string if missing
+        (value | capture("^(?<num>[0-9.]+)([KMGTPEZY]i?B?)?$") as $captured |
+         if $captured.num? and ($captured.num | tonumber? | type) == "number" then # Check if num exists and is a valid number
+           ($captured.num | tonumber) as $num |
+           ($captured.unit? // "") as $unit_str |
            (
              if $unit_str == "Ki" or $unit_str == "K" or $unit_str == "KiB" then $num / 1024
              elif $unit_str == "Mi" or $unit_str == "M" or $unit_str == "MiB" then $num
@@ -222,7 +227,7 @@ get_workload_resources() {
              end
            )
          else
-           0 # Invalid number format
+           0 # Invalid number format or no number captured
          end
         )
       end;
@@ -232,16 +237,16 @@ get_workload_resources() {
       if value == "" then 0
       else
         (value | capture("^(?<num>[0-9.]+)(?<unit>m)?$") as $captured |
-         if $captured.num? then
-           ($captured.num | tonumber? // 0) as $num |
-           ($captured.unit? // "") as $unit_str | # Default unit to empty string if missing (implies cores)
+         if $captured.num? and ($captured.num | tonumber? | type) == "number" then
+           ($captured.num | tonumber) as $num |
+           ($captured.unit? // "") as $unit_str |
            (
              if $unit_str == "m" then $num # Already millicores
              else $num * 1000 # Assume cores
              end
            )
          else
-           0 # Invalid number format
+           0
          end
         )
       end;
@@ -249,7 +254,7 @@ get_workload_resources() {
     # Helper function to format memory values to MiB with units for workload resources
     def format_mem_mib_workload_new(value):
       if value == "" then ""
-      else (parse_memory_to_mib(value) * 100 | round) / 100 | tostring + "Mi"
+      else (parse_memory_to_mib(value) | round) | tostring + "Mi" # Changed to round directly
       end;
 
     # Helper function to format CPU values to millicores with 'm' unit for workload resources
@@ -300,10 +305,10 @@ get_resource_quota_details() {
     def parse_memory_to_mib(value):
       if value == "" then 0
       else
-        (value | capture("^(?<num>[0-9.]+)(?<unit>[KMGTPEZY]i?B?)?$") as $captured |
-         if $captured.num? then
-           ($captured.num | tonumber? // 0) as $num |
-           ($captured.unit? // "") as $unit_str | # Default unit to empty string if missing
+        (value | capture("^(?<num>[0-9.]+)([KMGTPEZY]i?B?)?$") as $captured |
+         if $captured.num? and ($captured.num | tonumber? | type) == "number" then
+           ($captured.num | tonumber) as $num |
+           ($captured.unit? // "") as $unit_str |
            (
              if $unit_str == "Ki" or $unit_str == "K" or $unit_str == "KiB" then $num / 1024
              elif $unit_str == "Mi" or $unit_str == "M" or $unit_str == "MiB" then $num
@@ -313,7 +318,7 @@ get_resource_quota_details() {
              end
            )
          else
-           0 # Invalid number format
+           0
          end
         )
       end;
@@ -323,16 +328,16 @@ get_resource_quota_details() {
       if value == "" then 0
       else
         (value | capture("^(?<num>[0-9.]+)(?<unit>m)?$") as $captured |
-         if $captured.num? then
-           ($captured.num | tonumber? // 0) as $num |
-           ($captured.unit? // "") as $unit_str | # Default unit to empty string if missing (implies cores)
+         if $captured.num? and ($captured.num | tonumber? | type) == "number" then
+           ($captured.num | tonumber) as $num |
+           ($captured.unit? // "") as $unit_str |
            (
-             if $unit_str == "m" then $num # Already millicores
+             if $unit_str == "m" then $num
              else $num * 1000 # Assume cores
              end
            )
          else
-           0 # Invalid number format
+           0
          end
         )
       end;
@@ -428,10 +433,10 @@ get_limit_range_details() {
     def parse_memory_to_mib(value):
       if value == "" then 0
       else
-        (value | capture("^(?<num>[0-9.]+)(?<unit>[KMGTPEZY]i?B?)?$") as $captured |
-         if $captured.num? then
-           ($captured.num | tonumber? // 0) as $num |
-           ($captured.unit? // "") as $unit_str | # Default unit to empty string if missing
+        (value | capture("^(?<num>[0-9.]+)([KMGTPEZY]i?B?)?$") as $captured |
+         if $captured.num? and ($captured.num | tonumber? | type) == "number" then
+           ($captured.num | tonumber) as $num |
+           ($captured.unit? // "") as $unit_str |
            (
              if $unit_str == "Ki" or $unit_str == "K" or $unit_str == "KiB" then $num / 1024
              elif $unit_str == "Mi" or $unit_str == "M" or $unit_str == "MiB" then $num
@@ -441,7 +446,7 @@ get_limit_range_details() {
              end
            )
          else
-           0 # Invalid number format
+           0
          end
         )
       end;
@@ -451,16 +456,16 @@ get_limit_range_details() {
       if value == "" then 0
       else
         (value | capture("^(?<num>[0-9.]+)(?<unit>m)?$") as $captured |
-         if $captured.num? then
-           ($captured.num | tonumber? // 0) as $num |
-           ($captured.unit? // "") as $unit_str | # Default unit to empty string if missing (implies cores)
+         if $captured.num? and ($captured.num | tonumber? | type) == "number" then
+           ($captured.num | tonumber) as $num |
+           ($captured.unit? // "") as $unit_str |
            (
-             if $unit_str == "m" then $num # Already millicores
+             if $unit_str == "m" then $num
              else $num * 1000 # Assume cores
              end
            )
          else
-           0 # Invalid number format
+           0
          end
         )
       end;
@@ -468,7 +473,7 @@ get_limit_range_details() {
     # New formatters using the generic parsers
     def format_mem_mib_lr_new(value):
       if value == "" then ""
-      else (parse_memory_to_mib(value) * 100 | round) / 100 | tostring + "Mi"
+      else (parse_memory_to_mib(value) | round) | tostring + "Mi" # Changed to round directly
       end;
 
     def format_cpu_m_lr_new(value):
@@ -539,10 +544,36 @@ get_node_details() {
   local cpu_capacity_raw=""
   local mem_capacity_raw=""
 
-  # Get capacity from JSON output (more reliable)
+  # Use temporary variables to capture jq output and check success
+  local temp_cpu_capacity
+  local temp_mem_capacity
+
+  # Validate JSON output before processing with jq
   if [ -n "$node_json_output" ]; then
-    cpu_capacity_raw=$(echo "$node_json_output" | jq -r '.status.capacity.cpu // ""')
-    mem_capacity_raw=$(echo "$node_json_output" | jq -r '.status.capacity.memory // ""')
+    if echo "$node_json_output" | jq -e . >/dev/null 2>&1; then
+      # Attempt to get CPU capacity
+      if temp_cpu_capacity=$(echo "$node_json_output" | jq -r '.status.capacity.cpu // ""' 2>/dev/null); then
+        cpu_capacity_raw="$temp_cpu_capacity"
+      else
+        cpu_capacity_raw="" # If jq command itself fails, set to empty
+      fi
+
+      # Attempt to get Memory capacity
+      if temp_mem_capacity=$(echo "$node_json_output" | jq -r '.status.capacity.memory // ""' 2>/dev/null); then
+        mem_capacity_raw="$temp_mem_capacity"
+      else
+        mem_capacity_raw="" # If jq command itself fails, set to empty
+      fi
+    else
+      # If not valid JSON (as per jq -e .), set capacities to empty
+      cpu_capacity_raw=""
+      mem_capacity_raw=""
+      # echo "Warning: Malformed JSON output for node $node_name from 'oc get node'. Capacity will be empty." >&2
+    fi
+  else
+    # If JSON is empty, set capacities to empty
+    cpu_capacity_raw=""
+    mem_capacity_raw=""
   fi
 
   # Convert node-level memory capacity to GiB
@@ -584,13 +615,14 @@ get_node_details() {
 
     # Extract the "Non-terminated Pods" block for detailed pod info
     local non_terminated_pods_block=$(echo "$node_describe_output" | awk '
-      /^Non-terminated Pods:/ {in_block=1; next}
+      /^Non-terminated Pods:/ {in_block=1; lines_skipped=0; next} # Start block, reset counter
       /^Allocated resources:/ {in_block=0}
       in_block {
-        # Skip the header line (e.g., "Namespace    Name ...") and lines with only dashes
-        if ($0 !~ /Namespace\s+Name\s+CPU Requests/ && $0 !~ /^--*$/) {
-          print
+        if (lines_skipped < 2) { # Skip the first two lines (header and dashes)
+          lines_skipped++;
+          next;
         }
+        print
       }'
     )
   fi
@@ -611,10 +643,12 @@ get_node_details() {
     if [ -n "$pod_line" ]; then # Ensure the line is not empty
       local ns_name=$(echo "$pod_line" | awk '{print $1}')
       local p_name=$(echo "$pod_line" | awk '{print $2}')
-      local cpu_req_raw=$(echo "$pod_line" | awk '{print $3}' | sed 's/([^)]*)//g' | tr -d '[:space:]') # Remove percentage and spaces
-      local cpu_limit_raw=$(echo "$pod_line" | awk '{print $4}' | sed 's/([^)]*)//g' | tr -d '[:space:]')
-      local mem_req_raw=$(echo "$pod_line" | awk '{print $5}' | sed 's/([^)]*)//g' | tr -d '[:space:]')
-      local mem_limit_raw=$(echo "$pod_line" | awk '{print $6}' | sed 's/([^)]*)//g' | tr -d '[:space:]')
+      # Adjusted awk field numbers to account for percentage columns
+      # CPU Request: $3, CPU Limit: $5, Memory Request: $7, Memory Limit: $9
+      local cpu_req_raw=$(echo "$pod_line" | awk '{print $3}')
+      local cpu_limit_raw=$(echo "$pod_line" | awk '{print $5}')
+      local mem_req_raw=$(echo "$pod_line" | awk '{print $7}')
+      local mem_limit_raw=$(echo "$pod_line" | awk '{print $9}')
 
       # Convert pod CPU to millicores and memory to MiB
       local p_cpu_req_formatted=$(format_cpu_m_bash "$cpu_req_raw")
@@ -701,7 +735,7 @@ fi
 
 if [ "$QUOTAS_OPTION_PRESENT" = true ]; then
   QUOTAS_OUTPUT_FILE="${OUTPUT_DIR}/quotas-limits.csv"
-  
+
   # Define header for Resource Quotas with specific units in CamelCase
   QUOTA_CSV_HEADER="Namespace,QuotaName,CpuHard (cores),CpuUsed (cores),MemoryHard (Gi),MemoryUsed (Gi),PodsHard,PodsUsed,RequestsCpuHard (cores),RequestsCpuUsed (cores),RequestsMemoryHard (Gi),RequestsMemoryUsed (Gi),LimitsCpuHard (cores),LimitsCpuUsed (cores),LimitsMemoryHard (Gi),LimitsMemoryUsed (Gi),PvcsHard,PvcsUsed,RequestsStorageHard (Gi),RequestsStorageUsed (Gi),ConfigMapsHard,ConfigMapsUsed,SecretsHard,SecretsUsed,ServicesHard,ServicesUsed"
 
@@ -767,7 +801,7 @@ fi
 if [ "$NODES_OPTION_PRESENT" = true ]; then
   NODES_OUTPUT_FILE="${OUTPUT_DIR}/nodes.csv"
   # Define header for node data with specific units
-  NODE_SUMMARY_CSV_HEADER="CpuRequest (cores),CpuLimit (cores),MemoryRequest (Gi),MemoryLimit (Gi),CpuCapacity (cores),MemoryCapacity (Gi),PodsCount" 
+  NODE_SUMMARY_CSV_HEADER="CpuRequest (cores),CpuLimit (cores),MemoryRequest (Gi),MemoryLimit (Gi),CpuCapacity (cores),MemoryCapacity (Gi),PodsCount"
   POD_DETAILS_CSV_HEADER="Namespace,PodName,CpuRequest (m),CpuLimit (m),MemRequest (Mi),MemLimit (Mi)" # Updated header for Pods
 
   echo "Gathering node resource requests, limits, and pod counts. Output will be saved to '$NODES_OUTPUT_FILE'."
@@ -778,12 +812,12 @@ if [ "$NODES_OPTION_PRESENT" = true ]; then
   fi
 
   # Loop through nodes and format output as requested
-  for NODE in "$NODES"; do # Iterate over NODES correctly
+  for NODE in $NODES; do
     # Node Name Header
     echo "# --- $NODE ---" >> "$NODES_OUTPUT_FILE"
     # Node Summary Headers
     echo "$NODE_SUMMARY_CSV_HEADER" >> "$NODES_OUTPUT_FILE"
-    
+
     if [ "$DEBUG_MODE" = true ]; then
       echo "# --- $NODE ---"
       echo "$NODE_SUMMARY_CSV_HEADER"
