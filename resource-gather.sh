@@ -354,12 +354,7 @@ get_resource_quota_details() {
       end;
 
     {
-      cpu_hard: (format_cpu_cores_quota_new((.spec.hard.cpu // "") // "")),
-      cpu_used: (format_cpu_cores_quota_new((.status.used.cpu // "") // "")),
-
-      memory_hard: (format_mem_gib_quota_new((.spec.hard.memory // "") // "")),
-      memory_used: (format_mem_gib_quota_new((.status.used.memory // "") // "")),
-
+      # Removed cpu_hard, cpu_used, memory_hard, memory_used as they are not typically present in resource quotas
       pods_hard: ((.spec.hard.pods // "") // ""),
       pods_used: ((.status.used.pods // "") // ""),
 
@@ -393,8 +388,7 @@ get_resource_quota_details() {
     [
       $namespace,
       $quota_name,
-      .cpu_hard, .cpu_used,
-      .memory_hard, .memory_used,
+      # Removed .cpu_hard, .cpu_used, .memory_hard, .memory_used
       .pods_hard, .pods_used,
       .requests_cpu_hard, .requests_cpu_used,
       .requests_memory_hard, .requests_memory_used,
@@ -737,7 +731,7 @@ if [ "$QUOTAS_OPTION_PRESENT" = true ]; then
   QUOTAS_OUTPUT_FILE="${OUTPUT_DIR}/quotas-limits.csv"
 
   # Define header for Resource Quotas with specific units in CamelCase
-  QUOTA_CSV_HEADER="Namespace,QuotaName,CpuHard (cores),CpuUsed (cores),MemoryHard (Gi),MemoryUsed (Gi),PodsHard,PodsUsed,RequestsCpuHard (cores),RequestsCpuUsed (cores),RequestsMemoryHard (Gi),RequestsMemoryUsed (Gi),LimitsCpuHard (cores),LimitsCpuUsed (cores),LimitsMemoryHard (Gi),LimitsMemoryUsed (Gi),PvcsHard,PvcsUsed,RequestsStorageHard (Gi),RequestsStorageUsed (Gi),ConfigMapsHard,ConfigMapsUsed,SecretsHard,SecretsUsed,ServicesHard,ServicesUsed"
+  QUOTA_CSV_HEADER="Namespace,QuotaName,PodsHard,PodsUsed,RequestsCpuHard (cores),RequestsCpuUsed (cores),RequestsMemoryHard (Gi),RequestsMemoryUsed (Gi),LimitsCpuHard (cores),LimitsCpuUsed (cores),LimitsMemoryHard (Gi),LimitsMemoryUsed (Gi),PvcsHard,PvcsUsed,RequestsStorageHard (Gi),RequestsStorageUsed (Gi),ConfigMapsHard,ConfigMapsUsed,SecretsHard,SecretsUsed,ServicesHard,ServicesUsed"
 
   # Define header for Limit Ranges with specific units in CamelCase
   LIMITRANGE_CSV_HEADER="Namespace,LimitRangeName,ContainerDefaultCpuRequest (m),ContainerDefaultMemoryRequest (Mi),ContainerDefaultCpuLimit (m),ContainerDefaultMemoryLimit (Mi),ContainerMaxCpu (m),ContainerMaxMemory (Mi),ContainerMinCpu (m),ContainerMinMemory (Mi),PodMaxCpu (m),PodMaxMemory (Mi),PodMinCpu (m),PodMinMemory (Mi),PodDefaultCpuRequest (m),PodDefaultMemoryRequest (Mi),PodDefaultCpuLimit (m),PodDefaultMemoryLimit (Mi),PvcDefaultStorage (Mi),PvcMaxStorage (Mi)"
