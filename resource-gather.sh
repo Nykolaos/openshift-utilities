@@ -7,7 +7,7 @@ export LC_NUMERIC=C
 
 # Function to display script usage
 usage() {
-  echo "Usage: $0 [--workloads] [--quotas-limits] [--nodes] [--debug]"
+  echo "Usage: $0 [--workloads] [--quotas-limits] [--nodes] [--volumes] [--debug]"
   echo "  --workloads     : Gathers deployment, deploymentconfig, and statefulset resource requests and limits."
   echo "                    Converts CPU values to millicores (m) and memory values to mebibytes (Mi)."
   echo "                    Generates 'workload.csv' inside a timestamped 'resource-gather_YYYYMMDD_HHMMSS' folder."
@@ -18,11 +18,14 @@ usage() {
   echo "                    Converts node-level memory values to GiB and CPU values to cores."
   echo "                    Pod-level details will show memory in MiB and CPU in millicores."
   echo "                    Generates 'nodes.csv' inside a timestamped 'resource-gather_YYYYMMDD_HHMMSS' folder."
+  echo "  --volumes       : Gathers Persistent Volume (PV) details, including associated PVC, PV size, access mode, and related pods with their owning workloads. If no pods are found, it checks for referring workloads."
+  echo "                    Generates 'volumes.csv' inside a timestamped 'resource-gather_YYYYMMDD_HHMMSS' folder."
   echo "  --debug         : Prints detailed CSV data to stdout during execution."
   echo ""
   echo "Example: $0 --workloads"
   echo "Example: $0 --quotas-limits --debug"
   echo "Example: $0 --nodes"
+  echo "Example: $0 --volumes"
   exit 1
 }
 
@@ -51,6 +54,7 @@ fi
 WORKLOAD_OPTION_PRESENT=false
 QUOTAS_OPTION_PRESENT=false
 NODES_OPTION_PRESENT=false
+VOLUMES_OPTION_PRESENT=false # New flag for volumes
 DEBUG_MODE=false
 
 # Parse command line arguments
@@ -64,6 +68,9 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --nodes)
       NODES_OPTION_PRESENT=true
+      ;;
+    --volumes) # Handle new volumes option
+      VOLUMES_OPTION_PRESENT=true
       ;;
     --debug)
       DEBUG_MODE=true
@@ -80,7 +87,8 @@ done
 # If no options provided, print usage
 if [ "$WORKLOAD_OPTION_PRESENT" = false ] && \
    [ "$QUOTAS_OPTION_PRESENT" = false ] && \
-   [ "$NODES_OPTION_PRESENT" = false ]; then
+   [ "$NODES_OPTION_PRESENT" = false ] && \
+   [ "$VOLUMES_OPTION_PRESENT" = false ]; then # Include new flag in check
   usage
 fi
 
@@ -241,7 +249,7 @@ get_workload_resources() {
            ($captured.num | tonumber) as $num |
            ($captured.unit? // "") as $unit_str |
            (
-             if $unit_str == "m" then $num # Already millicores
+             if $unit_str == "m" then $num
              else $num * 1000 # Assume cores
              end
            )
@@ -354,7 +362,6 @@ get_resource_quota_details() {
       end;
 
     {
-      # Removed cpu_hard, cpu_used, memory_hard, memory_used as they are not typically present in resource quotas
       pods_hard: ((.spec.hard.pods // "") // ""),
       pods_used: ((.status.used.pods // "") // ""),
 
@@ -388,7 +395,6 @@ get_resource_quota_details() {
     [
       $namespace,
       $quota_name,
-      # Removed .cpu_hard, .cpu_used, .memory_hard, .memory_used
       .pods_hard, .pods_used,
       .requests_cpu_hard, .requests_cpu_used,
       .requests_memory_hard, .requests_memory_used,
@@ -514,16 +520,20 @@ get_limit_range_details() {
 EOF_JQ_FILTER
 )
 
-  oc get limitrange "$limitrange_name" -n "$namespace" -o json | \
-    jq -r \
-       --arg namespace "$namespace" \
-       --arg limitrange_name "$limitrange_name" \
-       "$jq_filter"
+  local quota_json
+  quota_json=$(oc get resourcequota "$quota_name" -n "$namespace" -o json 2>/dev/null)
+
+  if [ -n "$quota_json" ]; then
+    if echo "$quota_json" | jq -e . >/dev/null 2>&1; then
+      echo "$quota_json" | jq -r \
+        --arg namespace "$namespace" \
+        --arg quota_name "$quota_name" \
+        "$jq_filter"
+    fi
+  fi
 }
 
-# --- Node Resource Gathering Functions ---
-
-# Function to get node details: total requests, total limits, pod count, and capacity
+# Function to get Node details: total requests, total limits, pod count, and capacity
 # This function now outputs a multi-line string containing node summary and pod details, with converted units.
 get_node_details() {
   local node_name=$1
@@ -657,6 +667,162 @@ get_node_details() {
   # Return the node summary line followed by pod details structure
   echo -e "$node_summary_line\n# --- Pods ---\nNamespace,PodName,CPURequest,CPULimit,MemRequest,MemLimit$pod_details_output"
 }
+
+# --- Volume Gathering Functions ---
+get_volume_details() {
+  local pv_name=$1
+  local pv_json_output
+  pv_json_output=$(oc get pv "$pv_name" -o json 2>/dev/null)
+
+  local pv_size="N/A"
+  local pvc_name="N/A"
+  local pvc_namespace="N/A"
+  local pvc_access_modes="N/A"
+  local -a collected_output_lines # Array to collect all output lines for this PV
+  local -a active_pod_owners_found # Array to store "Kind/Name" of workloads owning active pods
+
+  if [ -n "$pv_json_output" ]; then
+    if echo "$pv_json_output" | jq -e . >/dev/null 2>&1; then
+      pv_size=$(echo "$pv_json_output" | jq -r '.spec.capacity.storage // "N/A"' 2>/dev/null)
+      pvc_name=$(echo "$pv_json_output" | jq -r '.spec.claimRef.name // "N/A"' 2>/dev/null)
+      pvc_namespace=$(echo "$pv_json_output" | jq -r '.spec.claimRef.namespace // "N/A"' 2>/dev/null)
+
+      if [ "$pvc_name" != "N/A" ] && [ "$pvc_namespace" != "N/A" ]; then
+        local pvc_json_output
+        pvc_json_output=$(oc get pvc "$pvc_name" -n "$pvc_namespace" -o json 2>/dev/null)
+
+        if [ -n "$pvc_json_output" ] && echo "$pvc_json_output" | jq -e . >/dev/null 2>&1; then
+          pvc_access_modes=$(echo "$pvc_json_output" | jq -r '.spec.accessModes | join(",") // "N/A"' 2>/dev/null)
+        fi
+
+        # --- Stage 1: Find active pods mounting this PVC ---
+        local pods_json
+        pods_json=$(oc get pod -n "$pvc_namespace" -o json 2>/dev/null)
+
+        if [ -n "$pods_json" ] && echo "$pods_json" | jq -e . >/dev/null 2>&1; then
+          local pod_output
+          pod_output=$(echo "$pods_json" | jq -r \
+            --arg pv_name "$pv_name" \
+            --arg pvc_name "$pvc_name" \
+            --arg pvc_namespace "$pvc_namespace" \
+            --arg pv_size "$pv_size" \
+            --arg pvc_access_modes "$pvc_access_modes" \
+            --arg target_pvc_name "$pvc_name" \
+            '
+            .items[] |
+            # Select pods that use the target PVC
+            select(
+              .spec.volumes[]? | .persistentVolumeClaim? | .claimName? == $target_pvc_name
+            ) |
+            {
+              podName: .metadata.name,
+              ownerKind: (
+                (.metadata.ownerReferences[]? | select(.controller == true) | .kind) // "N/A"
+              ),
+              ownerName: (
+                (.metadata.ownerReferences[]? | select(.controller == true) | .name) // "N/A"
+              )
+            } |
+            # Construct the full CSV line for active pods
+            "\"" + $pv_name + "\",\"" + $pvc_name + "\",\"" + $pvc_namespace + "\",\"" + $pv_size + "\",\"" + $pvc_access_modes + "\",\"" + .podName + "\",\"" +
+            (
+              if .ownerKind != "N/A" and .ownerName != "N/A" then
+                .ownerKind + "/" + .ownerName
+              else
+                "N/A"
+              end
+            ) + "\""
+          ' 2>/dev/null)
+
+          if [ -n "$pod_output" ]; then
+            # Read each line of pod_output and add to collected_output_lines
+            while IFS= read -r line; do
+              collected_output_lines+=("$line")
+              # Extract ownerKind/ownerName to prevent duplicate reporting in Stage 2
+              local owner_info=$(echo "$line" | awk -F',' '{print $7}' | tr -d '"') # Get the 7th field (RelatedWorkload)
+              if [[ "$owner_info" != "N/A" ]]; then
+                active_pod_owners_found+=("$owner_info")
+              fi
+            done <<< "$pod_output"
+          fi
+        fi
+
+        # --- Stage 2: Find referring workloads that are NOT already covered by active pods ---
+        local workloads_json
+        workloads_json=$(oc get deployment,deploymentconfig,statefulset,daemonset,cronjob -n "$pvc_namespace" -o json 2>/dev/null)
+
+        if [ -n "$workloads_json" ] && echo "$workloads_json" | jq -e . >/dev/null 2>&1; then
+          local referring_workload_output
+          # Convert bash array to a JSON array string for jq
+          local active_owners_json=$(printf '%s\n' "${active_pod_owners_found[@]}" | jq -R . | jq -s .)
+
+          referring_workload_output=$(echo "$workloads_json" | jq -r \
+            --arg pv_name "$pv_name" \
+            --arg pvc_name "$pvc_name" \
+            --arg pvc_namespace "$pvc_namespace" \
+            --arg pv_size "$pv_size" \
+            --arg pvc_access_modes "$pvc_access_modes" \
+            --arg target_pvc_name "$pvc_name" \
+            --argjson active_owners "$active_owners_json" \
+            '
+            .items[] |
+            (
+              if .kind == "Deployment" or .kind == "DeploymentConfig" or .kind == "StatefulSet" or .kind == "DaemonSet" then
+                .spec.template.spec.volumes[]?
+              elif .kind == "CronJob" then
+                .spec.jobTemplate.spec.template.spec.volumes[]?
+              else
+                empty
+              end
+            ) as $volume
+            |
+            # Select workloads that refer to the target PVC AND are not in the active_owners list
+            select($volume.persistentVolumeClaim.claimName? == $target_pvc_name) |
+            select(
+                (
+                    if .kind != "N/A" and .metadata.name != "N/A" then
+                        .kind + "/" + .metadata.name
+                    else
+                        "N/A"
+                    end
+                ) as $current_workload_id
+                |
+                ($active_owners | index($current_workload_id) | not)
+            )
+            |
+            # Construct the full CSV line for referring workloads (Pod count is 0)
+            "\"" + $pv_name + "\",\"" + $pvc_name + "\",\"" + $pvc_namespace + "\",\"" + $pv_size + "\",\"" + $pvc_access_modes + "\",\"0\",\"" + .kind + "/" + .metadata.name + "\""
+          ' 2>/dev/null)
+
+          if [ -n "$referring_workload_output" ]; then
+            while IFS= read -r line; do
+              collected_output_lines+=("$line")
+            done <<< "$referring_workload_output"
+          fi
+        fi
+
+        # --- Final Output ---
+        if [ ${#collected_output_lines[@]} -eq 0 ]; then
+          # If no pods or referring workloads found at all
+          echo "\"$pv_name\",\"$pvc_name\",\"$pvc_namespace\",\"$pv_size\",\"$pvc_access_modes\",\"N/A\",\"N/A\""
+        else
+          # Print all collected lines, each on a new line
+          printf "%s\n" "${collected_output_lines[@]}"
+        fi
+      else
+        # If PVC name or namespace is N/A from PV, output with N/A for all related fields
+        echo "\"$pv_name\",\"$pvc_name\",\"$pvc_namespace\",\"$pv_size\",\"N/A\",\"N/A\",\"N/A\""
+      fi
+    else
+      # If oc get pv command failed or returned empty/invalid JSON for the PV
+      echo "\"$pv_name\",\"N/A\",\"N/A\",\"N/A\",\"N/A\",\"N/A\",\"N/A\""
+    fi
+  else
+    # If pv_json_output is empty (e.g., PV not found)
+    echo "\"$pv_name\",\"N/A\",\"N/A\",\"N/A\",\"N/A\",\"N/A\",\"N/A\""
+  fi
+}
+
 
 # Get namespaces (used for workload/quotas)
 # Using 'oc get projects' for OpenShift specific project listing.
@@ -839,6 +1005,36 @@ if [ "$NODES_OPTION_PRESENT" = true ]; then
   done
   echo ""
   echo "Node data collection complete. Output saved to '$NODES_OUTPUT_FILE'."
+fi
+
+if [ "$VOLUMES_OPTION_PRESENT" = true ]; then
+  VOLUMES_OUTPUT_FILE="${OUTPUT_DIR}/volumes.csv"
+  # Updated header to include PVCNamespace, AccessMode, RelatedPod, and RelatedWorkload
+  VOLUMES_CSV_HEADER="PVName,PVCName,PVCNamespace,PVSize,AccessMode,RelatedPod,RelatedWorkload"
+
+  echo "$VOLUMES_CSV_HEADER" > "$VOLUMES_OUTPUT_FILE"
+  echo "Gathering Persistent Volume details. Output will be saved to '$VOLUMES_OUTPUT_FILE'."
+  echo "" # Newline for readability
+
+  if [ "$DEBUG_MODE" = true ]; then
+    echo "--- Volume Details ---" # Print header only in debug mode
+    echo "$VOLUMES_CSV_HEADER"    # Print header only in debug mode
+  fi
+
+  # Get all PVs
+  ALL_PVS=$(oc get pv -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+  for PV in $ALL_PVS; do
+    VOLUME_DATA=$(get_volume_details "$PV")
+    if [ -n "$VOLUME_DATA" ]; then
+      echo "$VOLUME_DATA" >> "$VOLUMES_OUTPUT_FILE"
+      if [ "$DEBUG_MODE" = true ]; then
+        echo "$VOLUME_DATA"
+      fi
+    fi
+  done
+  echo ""
+  echo "Persistent Volume data collection complete. Output saved to '$VOLUMES_OUTPUT_FILE'."
 fi
 
 echo ""
