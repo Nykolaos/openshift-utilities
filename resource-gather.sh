@@ -496,7 +496,8 @@ get_limit_range_details() {
       pod_maxMemory: (format_mem_mib_lr_new((( .Pod // {}).max // {}).memory // "")),
       pod_minCpu: (format_cpu_m_lr_new((( .Pod // {}).min // {}).cpu // "")),
       pod_minMemory: (format_mem_mib_lr_new((( .Pod // {}).min // {}).memory // "")),
-      pod_defaultCpuRequest: (format_cpu_m_lr_new((( .Pod // {}).defaultRequest // {}).cpu // "")),
+      # Corrected path for pod_defaultCpuRequest
+      pod_defaultCpuRequest: (format_cpu_m_lr_new(((( .Pod // {}).defaultRequest // {}).cpu // "") // "")),
       pod_defaultMemoryRequest: (format_mem_mib_lr_new((( .Pod // {}).defaultRequest // {}).memory // "")),
       pod_defaultCpuLimit: (format_cpu_m_lr_new((( .Pod // {}).default // {}).cpu // "")),
       pod_defaultMemoryLimit: (format_mem_mib_lr_new((( .Pod // {}).default // {}).memory // "")),
@@ -520,14 +521,14 @@ get_limit_range_details() {
 EOF_JQ_FILTER
 )
 
-  local quota_json
-  quota_json=$(oc get resourcequota "$quota_name" -n "$namespace" -o json 2>/dev/null)
+  local limitrange_json
+  limitrange_json=$(oc get limitrange "$limitrange_name" -n "$namespace" -o json 2>/dev/null)
 
-  if [ -n "$quota_json" ]; then
-    if echo "$quota_json" | jq -e . >/dev/null 2>&1; then
-      echo "$quota_json" | jq -r \
+  if [ -n "$limitrange_json" ]; then
+    if echo "$limitrange_json" | jq -e . >/dev/null 2>&1; then
+      echo "$limitrange_json" | jq -r \
         --arg namespace "$namespace" \
-        --arg quota_name "$quota_name" \
+        --arg limitrange_name "$limitrange_name" \
         "$jq_filter"
     fi
   fi
