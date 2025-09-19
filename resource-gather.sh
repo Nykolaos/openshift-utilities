@@ -679,8 +679,7 @@ get_volume_details() {
   local pvc_name="N/A"
   local pvc_namespace="N/A"
   local pvc_access_modes="N/A"
-  local -a collected_output_lines # Array to collect all output lines for this PV
-  local -a active_pod_owners_found # Array to store "Kind/Name" of workloads owning active pods
+  local -a collected_workloads # Array to collect unique workloads found
 
   if [ -n "$pv_json_output" ]; then
     if echo "$pv_json_output" | jq -e . >/dev/null 2>&1; then
@@ -696,75 +695,15 @@ get_volume_details() {
           pvc_access_modes=$(echo "$pvc_json_output" | jq -r '.spec.accessModes | join(",") // "N/A"' 2>/dev/null)
         fi
 
-        # --- Stage 1: Find active pods mounting this PVC ---
-        local pods_json
-        pods_json=$(oc get pod -n "$pvc_namespace" -o json 2>/dev/null)
-
-        if [ -n "$pods_json" ] && echo "$pods_json" | jq -e . >/dev/null 2>&1; then
-          local pod_output
-          pod_output=$(echo "$pods_json" | jq -r \
-            --arg pv_name "$pv_name" \
-            --arg pvc_name "$pvc_name" \
-            --arg pvc_namespace "$pvc_namespace" \
-            --arg pv_size "$pv_size" \
-            --arg pvc_access_modes "$pvc_access_modes" \
-            --arg target_pvc_name "$pvc_name" \
-            '
-            .items[] |
-            # Select pods that use the target PVC
-            select(
-              .spec.volumes[]? | .persistentVolumeClaim? | .claimName? == $target_pvc_name
-            ) |
-            {
-              podName: .metadata.name,
-              ownerKind: (
-                (.metadata.ownerReferences[]? | select(.controller == true) | .kind) // "N/A"
-              ),
-              ownerName: (
-                (.metadata.ownerReferences[]? | select(.controller == true) | .name) // "N/A"
-              )
-            } |
-            # Construct the full CSV line for active pods
-            "\"" + $pv_name + "\",\"" + $pvc_name + "\",\"" + $pvc_namespace + "\",\"" + $pv_size + "\",\"" + $pvc_access_modes + "\",\"" + .podName + "\",\"" +
-            (
-              if .ownerKind != "N/A" and .ownerName != "N/A" then
-                .ownerKind + "/" + .ownerName
-              else
-                "N/A"
-              end
-            ) + "\""
-          ' 2>/dev/null)
-
-          if [ -n "$pod_output" ]; then
-            # Read each line of pod_output and add to collected_output_lines
-            while IFS= read -r line; do
-              collected_output_lines+=("$line")
-              # Extract ownerKind/ownerName to prevent duplicate reporting in Stage 2
-              local owner_info=$(echo "$line" | awk -F',' '{print $7}' | tr -d '"') # Get the 7th field (RelatedWorkload)
-              if [[ "$owner_info" != "N/A" ]]; then
-                active_pod_owners_found+=("$owner_info")
-              fi
-            done <<< "$pod_output"
-          fi
-        fi
-
-        # --- Stage 2: Find referring workloads that are NOT already covered by active pods ---
+        # --- New Logic: Find all workloads that use the PVC ---
         local workloads_json
         workloads_json=$(oc get deployment,deploymentconfig,statefulset,daemonset,cronjob -n "$pvc_namespace" -o json 2>/dev/null)
 
         if [ -n "$workloads_json" ] && echo "$workloads_json" | jq -e . >/dev/null 2>&1; then
-          local referring_workload_output
-          # Convert bash array to a JSON array string for jq
-          local active_owners_json=$(printf '%s\n' "${active_pod_owners_found[@]}" | jq -R . | jq -s .)
-
-          referring_workload_output=$(echo "$workloads_json" | jq -r \
-            --arg pv_name "$pv_name" \
+          # Use jq to find all workloads that refer to the PVC
+          local referring_workloads_output
+          referring_workloads_output=$(echo "$workloads_json" | jq -r \
             --arg pvc_name "$pvc_name" \
-            --arg pvc_namespace "$pvc_namespace" \
-            --arg pv_size "$pv_size" \
-            --arg pvc_access_modes "$pvc_access_modes" \
-            --arg target_pvc_name "$pvc_name" \
-            --argjson active_owners "$active_owners_json" \
             '
             .items[] |
             (
@@ -777,39 +716,69 @@ get_volume_details() {
               end
             ) as $volume
             |
-            # Select workloads that refer to the target PVC AND are not in the active_owners list
-            select($volume.persistentVolumeClaim.claimName? == $target_pvc_name) |
-            select(
-                (
-                    if .kind != "N/A" and .metadata.name != "N/A" then
-                        .kind + "/" + .metadata.name
-                    else
-                        "N/A"
-                    end
-                ) as $current_workload_id
-                |
-                ($active_owners | index($current_workload_id) | not)
-            )
-            |
-            # Construct the full CSV line for referring workloads (Pod count is 0)
-            "\"" + $pv_name + "\",\"" + $pvc_name + "\",\"" + $pvc_namespace + "\",\"" + $pv_size + "\",\"" + $pvc_access_modes + "\",\"0\",\"" + .kind + "/" + .metadata.name + "\""
+            # Select workloads that refer to the target PVC
+            select($volume.persistentVolumeClaim.claimName? == $pvc_name) |
+            # Output a simple, single-line string with the kind and name
+            "\(.kind) \(.metadata.name)"
           ' 2>/dev/null)
 
-          if [ -n "$referring_workload_output" ]; then
+          # Read each line and add to the array (ensures unique entries)
+          if [ -n "$referring_workloads_output" ]; then
             while IFS= read -r line; do
-              collected_output_lines+=("$line")
-            done <<< "$referring_workload_output"
+              collected_workloads+=("$line")
+            done <<< "$referring_workloads_output"
           fi
         fi
 
-        # --- Final Output ---
-        if [ ${#collected_output_lines[@]} -eq 0 ]; then
-          # If no pods or referring workloads found at all
-          echo "\"$pv_name\",\"$pvc_name\",\"$pvc_namespace\",\"$pv_size\",\"$pvc_access_modes\",\"N/A\",\"N/A\""
-        else
-          # Print all collected lines, each on a new line
-          printf "%s\n" "${collected_output_lines[@]}"
+        # --- Final Output Generation ---
+        local output_lines=() # Array to hold all final CSV lines for this PV
+        local has_related_workload=false
+
+        if [ ${#collected_workloads[@]} -gt 0 ]; then
+          has_related_workload=true
+          # Loop through each unique workload and get its pod count
+          for workload_info in "${collected_workloads[@]}"; do
+            local workload_kind=$(echo "$workload_info" | awk '{print $1}')
+            local workload_name=$(echo "$workload_info" | awk '{print $2}')
+            local pod_count=0
+
+            # Get the correct pod count based on the workload kind
+            case "$workload_kind" in
+              Deployment|DeploymentConfig)
+                # For Deployments and DeploymentConfigs, check .status.replicas
+                pod_count=$(oc get "$workload_kind" "$workload_name" -n "$pvc_namespace" -o jsonpath='{.status.replicas}' 2>/dev/null)
+                ;;
+              StatefulSet)
+                # For StatefulSets, check .status.currentReplicas
+                pod_count=$(oc get "$workload_kind" "$workload_name" -n "$pvc_namespace" -o jsonpath='{.status.currentReplicas}' 2>/dev/null)
+                ;;
+              DaemonSet)
+                # For DaemonSets, check .status.numberReady
+                pod_count=$(oc get "$workload_kind" "$workload_name" -n "$pvc_namespace" -o jsonpath='{.status.numberReady}' 2>/dev/null)
+                ;;
+              CronJob)
+                # CronJobs don't have a status.replicas field, so the pod count is 0 from the workload itself
+                pod_count=0
+                ;;
+              *)
+                pod_count=0
+                ;;
+            esac
+
+            # Build the final output line
+            local line="\"$pv_name\",\"$pvc_name\",\"$pvc_namespace\",\"$pv_size\",\"$pvc_access_modes\",\"$pod_count\",\"$workload_kind/$workload_name\""
+            output_lines+=("$line")
+          done
         fi
+
+        # If no related workloads were found, output a single line with "N/A"
+        if [ "$has_related_workload" = false ]; then
+            local line="\"$pv_name\",\"$pvc_name\",\"$pvc_namespace\",\"$pv_size\",\"$pvc_access_modes\",\"N/A\",\"N/A\""
+            output_lines+=("$line")
+        fi
+        
+        # Print all the collected output lines
+        printf "%s\n" "${output_lines[@]}"
       else
         # If PVC name or namespace is N/A from PV, output with N/A for all related fields
         echo "\"$pv_name\",\"$pvc_name\",\"$pvc_namespace\",\"$pv_size\",\"N/A\",\"N/A\",\"N/A\""
@@ -1011,7 +980,7 @@ fi
 if [ "$VOLUMES_OPTION_PRESENT" = true ]; then
   VOLUMES_OUTPUT_FILE="${OUTPUT_DIR}/volumes.csv"
   # Updated header to include PVCNamespace, AccessMode, RelatedPod, and RelatedWorkload
-  VOLUMES_CSV_HEADER="PVName,PVCName,PVCNamespace,PVSize,AccessMode,RelatedPod,RelatedWorkload"
+  VOLUMES_CSV_HEADER="PVName,PVCName,PVCNamespace,PVSize,AccessMode,PodCount,RelatedWorkload"
 
   echo "$VOLUMES_CSV_HEADER" > "$VOLUMES_OUTPUT_FILE"
   echo "Gathering Persistent Volume details. Output will be saved to '$VOLUMES_OUTPUT_FILE'."
